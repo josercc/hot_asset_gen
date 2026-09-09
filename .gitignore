@@ -1,0 +1,4 @@
+.dart_tool/package_config.json
+.dart_tool/package_graph.json
+.dart_tool/version
+pubspec.lock
