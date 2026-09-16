@@ -2,7 +2,12 @@
 
 通过本地资源表 + `AssetBundle` 覆盖，热更新 Flutter 静态资源。业务侧继续使用 `Image.asset` / FlutterGen `.image()` 等，无需改调用点。
 
-**应用请接上层 [`flutterpatch`](../../README.md)**，不要直接调本包的 `HotAssets`。本包是资源热更的内部实现。
+**应用请接上层 [`flutterpatch`](https://pub.dev/packages/flutterpatch)**，不要直接调本包的 `HotAssets`。本包是资源热更的内部实现。
+
+非 `Image.asset` 场景（音频 / 分享图 / `VideoPlayerController.file`）请用：
+
+- `FlutterPatch.load(key)` — 替代 `rootBundle.load`
+- `FlutterPatch.resolveFile(key)` — 热更落盘文件
 
 ## 快速接入（推荐）
 
@@ -30,6 +35,17 @@ Assets.images.logo.image(); // FlutterGen 同样走 DefaultAssetBundle
 ```
 
 仅资源、不跑代码补丁时可用 `FlutterPatch.syncResources()`。
+
+## 资源热更范围（约定）
+
+| 纳入 | 说明 |
+|------|------|
+| `assets/images/**` | 主路径；有 `2.0x`/`3.0x` 须整组上传 |
+| audios / videos / lottie | 业务须走 `FlutterPatch.load` / `resolveFile` |
+| **排除 fonts** | `pubspec.yaml` `fonts:` 启动注册，AssetBundle 管不到 |
+| **排除** 启动配置（如 `dart_define.json`） | 保持包内只读 |
+
+只替换已打进包的 asset key；换 `release_version` 会清本地资源表。
 
 ## 原理
 
