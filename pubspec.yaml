@@ -1,6 +1,6 @@
 name: hot_asset_gen
 description: Hot-update Flutter assets via a local resource table + AssetBundle override.
-version: 0.1.0
+version: 0.1.1
 homepage: https://github.com/josercc/hot_asset_gen
 repository: https://github.com/josercc/hot_asset_gen
 

@@ -16,6 +16,8 @@ class HotAssetRegistry {
     this.appId,
     this.releaseVersion,
     this.packNumber = 0,
+    this.patchNumber,
+    this.configFingerprint,
   }) : _entries = Map<String, String>.from(entries);
 
   /// Dart pubspec package name of the host app (e.g. `sample_app`).
@@ -27,6 +29,12 @@ class HotAssetRegistry {
   String? appId;
   String? releaseVersion;
   int packNumber;
+
+  /// Dart patch number this table belongs to (`null` / 0 = release baseline).
+  int? patchNumber;
+
+  /// Fingerprint of the full resource inventory for this table.
+  String? configFingerprint;
 
   final Map<String, String> _entries;
 
@@ -92,6 +100,14 @@ class HotAssetRegistry {
 
   void clearEntries() => _entries.clear();
 
+  /// Drop local table state so the next sync must re-download.
+  void invalidateLocalTable() {
+    clearEntries();
+    packNumber = 0;
+    patchNumber = null;
+    configFingerprint = null;
+  }
+
   Future<void> persist() async {
     final table = File(p.join(rootDir, tableFileName));
     table.parent.createSync(recursive: true);
@@ -100,6 +116,8 @@ class HotAssetRegistry {
       'app_id': appId,
       'release_version': releaseVersion,
       'pack_number': packNumber,
+      if (patchNumber != null) 'patch_number': patchNumber,
+      if (configFingerprint != null) 'config_fingerprint': configFingerprint,
       'updated_at': DateTime.now().toUtc().toIso8601String(),
       'entries': _entries,
     };
@@ -114,6 +132,9 @@ class HotAssetRegistry {
             'app_id': appId,
             'release_version': releaseVersion,
             'number': packNumber,
+            if (patchNumber != null) 'patch_number': patchNumber,
+            if (configFingerprint != null)
+              'config_fingerprint': configFingerprint,
             'updated_at': DateTime.now().toUtc().toIso8601String(),
           })}\n',
       flush: true,
@@ -121,10 +142,15 @@ class HotAssetRegistry {
   }
 
   /// Load table from disk (or empty). Does not talk to the network.
+  ///
+  /// When [releaseVersion] is provided and the on-disk table belongs to a
+  /// different release, the table is discarded (do not load stale config).
   static Future<HotAssetRegistry> load({
     required String appPackage,
     String? appId,
     String? releaseVersion,
+    int? patchNumber,
+    String? configFingerprint,
   }) async {
     final docs = await getApplicationDocumentsDirectory();
     final rootDir = p.join(docs.path, 'meta_ota_resources');
@@ -135,15 +161,25 @@ class HotAssetRegistry {
     String? storedAppId = appId;
     String? storedRelease = releaseVersion;
     var packNumber = 0;
+    int? storedPatch = patchNumber;
+    String? storedFingerprint = configFingerprint;
 
     if (tableFile.existsSync()) {
       try {
         final decoded = jsonDecode(await tableFile.readAsString());
         if (decoded is Map) {
           final sameApp = appId == null || decoded['app_id'] == appId;
-          final sameRelease =
-              releaseVersion == null || decoded['release_version'] == releaseVersion;
-          if (sameApp && sameRelease) {
+          // When caller supplies releaseVersion, mismatch → discard (1.0.0+1→+2).
+          final sameRelease = releaseVersion == null ||
+              decoded['release_version'] == releaseVersion;
+          final diskPatch = (decoded['patch_number'] as num?)?.toInt();
+          final samePatch =
+              patchNumber == null || diskPatch == patchNumber;
+          final diskFp = decoded['config_fingerprint'] as String?;
+          final sameFp = configFingerprint == null ||
+              configFingerprint.isEmpty ||
+              diskFp == configFingerprint;
+          if (sameApp && sameRelease && samePatch && sameFp) {
             final raw = decoded['entries'];
             if (raw is Map) {
               entries = {
@@ -156,6 +192,8 @@ class HotAssetRegistry {
             storedRelease =
                 decoded['release_version'] as String? ?? storedRelease;
             packNumber = (decoded['pack_number'] as num?)?.toInt() ?? 0;
+            storedPatch = diskPatch ?? storedPatch;
+            storedFingerprint = diskFp ?? storedFingerprint;
           }
         }
       } catch (_) {
@@ -176,6 +214,10 @@ class HotAssetRegistry {
               storedRelease =
                   decoded['release_version'] as String? ?? storedRelease;
               packNumber = (decoded['number'] as num?)?.toInt() ?? 0;
+              storedPatch =
+                  (decoded['patch_number'] as num?)?.toInt() ?? storedPatch;
+              storedFingerprint =
+                  decoded['config_fingerprint'] as String? ?? storedFingerprint;
               entries = await _scanExistingBlobs(
                 rootDir: rootDir,
                 appPackage: appPackage,
@@ -193,6 +235,8 @@ class HotAssetRegistry {
       appId: storedAppId,
       releaseVersion: storedRelease,
       packNumber: packNumber,
+      patchNumber: storedPatch,
+      configFingerprint: storedFingerprint,
     );
     if (entries.isNotEmpty && !tableFile.existsSync()) {
       await registry.persist();
