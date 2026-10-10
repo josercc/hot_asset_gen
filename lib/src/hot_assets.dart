@@ -9,11 +9,15 @@ import 'hot_asset_sync.dart';
 ///
 /// Usage:
 /// ```dart
-/// await HotAssets.init(appPackage: 'sample_app');
+/// await HotAssets.init(appPackage: 'sample_app', releaseVersion: '1.0.0+1');
 /// runApp(HotAssets.wrap(const MyApp()));
 /// // later:
-/// await HotAssets.sync(baseUrl: ..., appId: ..., releaseVersion: ...);
-/// // Image.asset('assets/foo.png') unchanged
+/// await HotAssets.sync(
+///   baseUrl: ...,
+///   appId: ...,
+///   releaseVersion: ...,
+///   patchNumber: 2,
+/// );
 /// ```
 class HotAssets {
   HotAssets._();
@@ -43,19 +47,30 @@ class HotAssets {
 
   static int get tableCount => _registry?.count ?? 0;
 
+  static int? get patchNumber => _registry?.patchNumber;
+
+  static String? get configFingerprint => _registry?.configFingerprint;
+
   static String? get resourceDir => _registry?.rootDir;
 
   /// Load local resource table (offline). Call once before [runApp].
+  ///
+  /// Pass [releaseVersion] so a newer binary does not load a stale table from
+  /// a previous release (e.g. `1.0.0+1` → `1.0.0+2`).
   static Future<void> init({
     required String appPackage,
     String? appId,
     String? releaseVersion,
+    int? patchNumber,
+    String? configFingerprint,
     AssetBundle? parent,
   }) async {
     _registry = await HotAssetRegistry.load(
       appPackage: appPackage,
       appId: appId,
       releaseVersion: releaseVersion,
+      patchNumber: patchNumber,
+      configFingerprint: configFingerprint,
     );
     _bundle = HotAssetBundle(
       parent: parent ?? rootBundle,
@@ -82,6 +97,8 @@ class HotAssets {
     String channel = 'stable',
     String clientId = 'hot-asset',
     String? uniqueId,
+    int? patchNumber,
+    String? platform,
     void Function(String)? onLog,
     bool clearImageCacheOnUpdate = true,
   }) async {
@@ -93,6 +110,8 @@ class HotAssets {
       channel: channel,
       clientId: clientId,
       uniqueId: uniqueId,
+      patchNumber: patchNumber,
+      platform: platform,
     ).checkAndApply(onLog: onLog);
 
     if (result.updated && clearImageCacheOnUpdate) {

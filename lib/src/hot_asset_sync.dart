@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 
@@ -12,12 +13,20 @@ class HotAssetSyncResult {
     required this.packNumber,
     required this.downloaded,
     required this.updated,
+    this.reason,
+    this.configFingerprintMismatch = false,
   });
 
   final String message;
   final int packNumber;
   final int downloaded;
   final bool updated;
+
+  /// Server `reason` when no pack was applied (e.g. fingerprint mismatch).
+  final String? reason;
+
+  /// True when local config fingerprint did not match the server table.
+  final bool configFingerprintMismatch;
 }
 
 /// Talks to Meta OTA `/api/v1/resources/check`, downloads blobs, updates
@@ -31,6 +40,8 @@ class HotAssetSync {
     this.channel = 'stable',
     this.clientId = 'hot-asset',
     this.uniqueId,
+    this.patchNumber,
+    this.platform,
     http.Client? httpClient,
   }) : _http = httpClient ?? http.Client();
 
@@ -44,6 +55,14 @@ class HotAssetSync {
   /// Local gray-release id ([FlutterPatch.setUniqueId]). Compared to response
   /// `unique_ids` on the client — empty allowlist = download for everyone.
   final String? uniqueId;
+
+  /// Dart patch number to fetch the resource table for.
+  /// `null` / ≤0 → release baseline pack.
+  final int? patchNumber;
+
+  /// `android` | `ios` | …
+  final String? platform;
+
   final http.Client _http;
 
   Future<HotAssetSyncResult> checkAndApply({
@@ -55,28 +74,53 @@ class HotAssetSync {
     final releaseChanged = (registry.appId != null && registry.appId != appId) ||
         (registry.releaseVersion != null &&
             registry.releaseVersion != releaseVersion);
-    if (releaseChanged) {
-      registry.clearEntries();
-      registry.packNumber = 0;
+    final patchChanged = patchNumber != null &&
+        patchNumber! > 0 &&
+        registry.patchNumber != null &&
+        registry.patchNumber != patchNumber;
+    if (releaseChanged || patchChanged) {
+      registry.invalidateLocalTable();
     }
     registry.appId = appId;
     registry.releaseVersion = releaseVersion;
+    if (patchNumber != null && patchNumber! > 0) {
+      registry.patchNumber = patchNumber;
+    }
 
     final root = baseUrl.replaceAll(RegExp(r'/$'), '');
+    // 曾错误地把「空增量补丁」标成已装 #N 且 entries=0，之后永远无更新。
+    // 本地有 pack 号却无条目时视为损坏，强制从 0 重新拉全量。
+    if (registry.packNumber > 0 && registry.count == 0) {
+      log(
+        '资源表损坏：已装 #${registry.packNumber} 但条目为 0，清空后按基础包重拉',
+      );
+      registry.invalidateLocalTable();
+      await registry.persist();
+    }
+
     final installed = registry.packNumber;
-    log('资源表 check（已装 #$installed，条目 ${registry.count}）…');
+    final localFp = registry.configFingerprint;
+    log(
+      '资源表 check（已装 #$installed，条目 ${registry.count}'
+      '${patchNumber != null && patchNumber! > 0 ? "，补丁 #$patchNumber" : ""}）…',
+    );
+
+    final bodyMap = <String, Object?>{
+      'app_id': appId,
+      'release_version': releaseVersion,
+      'channel': channel,
+      'client_id': clientId,
+      'resource_pack_number': installed,
+      if (platform != null && platform!.isNotEmpty) 'platform': platform,
+      if (patchNumber != null && patchNumber! > 0) 'patch_number': patchNumber,
+      if (localFp != null && localFp.isNotEmpty) 'config_fingerprint': localFp,
+    };
 
     final res = await _http
         .post(
           Uri.parse('$root/api/v1/resources/check'),
           headers: {'content-type': 'application/json'},
-          body: jsonEncode({
-            'app_id': appId,
-            'release_version': releaseVersion,
-            'channel': channel,
-            'client_id': clientId,
-            'resource_pack_number': installed,
-          }),
+          body: jsonEncode(bodyMap),
         )
         .timeout(const Duration(seconds: 12));
 
@@ -90,14 +134,103 @@ class HotAssetSync {
     }
 
     final body = jsonDecode(res.body) as Map<String, dynamic>;
+    final reason = body['reason'] as String?;
+
+    if (reason == 'config_fingerprint_mismatch') {
+      log('配置表指纹不一致，丢弃本地表');
+      registry.invalidateLocalTable();
+      await registry.persist();
+      final expectedFp = body['config_fingerprint'] as String?;
+      // Retry once without local fingerprint / pack number so the device can
+      // download the correct table for this release+patch.
+      return _downloadAndApply(
+        root: root,
+        body: body,
+        log: log,
+        installed: 0,
+        forceApply: true,
+        expectedFingerprint: expectedFp,
+        reason: reason,
+      );
+    }
+
     if (body['resource_pack_available'] != true) {
+      if (reason == 'resource_pack_missing_for_patch') {
+        log('补丁 #$patchNumber 无资源表，清空本地表');
+        registry.invalidateLocalTable();
+      }
       await registry.persist();
       return HotAssetSyncResult(
-        message: '资源表: 无更新（当前 #${body['number'] ?? installed}）',
+        message: reason == null
+            ? '资源表: 无更新（当前 #${body['number'] ?? installed}）'
+            : '资源表: 无更新（$reason）',
         packNumber: (body['number'] as num?)?.toInt() ?? installed,
         downloaded: 0,
         updated: false,
+        reason: reason,
+        configFingerprintMismatch: reason == 'config_fingerprint_mismatch',
       );
+    }
+
+    return _downloadAndApply(
+      root: root,
+      body: body,
+      log: log,
+      installed: installed,
+    );
+  }
+
+  Future<HotAssetSyncResult> _downloadAndApply({
+    required String root,
+    required Map<String, dynamic> body,
+    required void Function(String) log,
+    required int installed,
+    bool forceApply = false,
+    String? expectedFingerprint,
+    String? reason,
+  }) async {
+    // On fingerprint mismatch the first response has available=false but still
+    // carries the expected pack number — re-check without fingerprint.
+    if (forceApply && body['resource_pack_available'] != true) {
+      final retryBody = <String, Object?>{
+        'app_id': appId,
+        'release_version': releaseVersion,
+        'channel': channel,
+        'client_id': clientId,
+        'resource_pack_number': 0,
+        if (platform != null && platform!.isNotEmpty) 'platform': platform,
+        if (patchNumber != null && patchNumber! > 0)
+          'patch_number': patchNumber,
+      };
+      final retry = await _http
+          .post(
+            Uri.parse('$root/api/v1/resources/check'),
+            headers: {'content-type': 'application/json'},
+            body: jsonEncode(retryBody),
+          )
+          .timeout(const Duration(seconds: 12));
+      if (retry.statusCode != 200) {
+        return HotAssetSyncResult(
+          message: '资源表 re-check HTTP ${retry.statusCode}',
+          packNumber: 0,
+          downloaded: 0,
+          updated: false,
+          reason: reason,
+          configFingerprintMismatch: true,
+        );
+      }
+      body = jsonDecode(retry.body) as Map<String, dynamic>;
+      if (body['resource_pack_available'] != true) {
+        await registry.persist();
+        return HotAssetSyncResult(
+          message: '资源表: 指纹不一致且无可用包',
+          packNumber: 0,
+          downloaded: 0,
+          updated: false,
+          reason: reason,
+          configFingerprintMismatch: true,
+        );
+      }
     }
 
     final number = (body['number'] as num?)?.toInt() ?? 0;
@@ -122,6 +255,7 @@ class HotAssetSync {
     if (!outRoot.existsSync()) outRoot.createSync(recursive: true);
 
     var downloaded = 0;
+    var skipped = 0;
     for (final c in changes) {
       final change = '${c['change'] ?? ''}'.toLowerCase();
       final package = '${c['package'] ?? 'app'}';
@@ -137,9 +271,19 @@ class HotAssetSync {
       }
       if (change != 'add' && change != 'update') continue;
 
+      final hash = '${c['hash'] ?? ''}'.trim().toLowerCase();
+
+      // 全量物化后清单可能很大：本地已有且 hash 一致则跳过网络下载。
+      if (local.existsSync() &&
+          hash.isNotEmpty &&
+          await _localFileMatchesHash(local, hash)) {
+        registry.upsertBlob(package: package, path: path);
+        skipped++;
+        continue;
+      }
+
       var url = '${c['download_url'] ?? ''}'.trim();
       if (url.isEmpty) {
-        final hash = '${c['hash'] ?? ''}'.trim().toLowerCase();
         if (hash.isEmpty) continue;
         url = '$root/api/v1/assets/$hash/content';
       }
@@ -158,15 +302,39 @@ class HotAssetSync {
     }
 
     registry.packNumber = number;
+    final fp = (body['config_fingerprint'] as String?) ?? expectedFingerprint;
+    if (fp != null && fp.isNotEmpty) {
+      registry.configFingerprint = fp;
+    }
+    final pn = (body['patch_number'] as num?)?.toInt() ?? patchNumber;
+    if (pn != null && pn > 0) {
+      registry.patchNumber = pn;
+    }
     await registry.persist();
 
+    final skipHint = skipped > 0 ? '，跳过已存在 $skipped' : '';
     return HotAssetSyncResult(
       message:
-          '资源表 #$number 已应用（下载 $downloaded → ${registry.rootDir}，条目 ${registry.count}）',
+          '资源表 #$number 已应用（下载 $downloaded$skipHint → ${registry.rootDir}，条目 ${registry.count}）',
       packNumber: number,
       downloaded: downloaded,
       updated: true,
+      reason: reason,
+      configFingerprintMismatch: reason == 'config_fingerprint_mismatch',
     );
+  }
+
+  /// Compare on-disk file to the content-addressed [expectedHash] (sha256 hex).
+  static Future<bool> _localFileMatchesHash(
+    File local,
+    String expectedHash,
+  ) async {
+    try {
+      final digest = await sha256.bind(local.openRead()).first;
+      return digest.toString() == expectedHash;
+    } catch (_) {
+      return false;
+    }
   }
 
   static List<String>? _parseUniqueIds(Object? raw) {
